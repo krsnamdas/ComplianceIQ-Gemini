@@ -1,7 +1,9 @@
 # ComplianceIQ — Application Manual
 
 > **Audience:** anyone using or maintaining the *application* (features, screens, accounts,
-> APIs, data). For how to run/deploy this Gemini edition, see **[`README.md`](./README.md)**.
+> APIs, data). For the **AWS infrastructure** that hosts it, see
+> **[`infra/INFRASTRUCTURE_MANUAL.md`](./infra/INFRASTRUCTURE_MANUAL.md)**. For the roadmap,
+> see **[`infra/FUTURE_DESIGN_CONSIDERATIONS.md`](./infra/FUTURE_DESIGN_CONSIDERATIONS.md)**.
 >
 > **If reading cold: start at [§1](#1-what-complianceiq-is) and [§3 How to access](#3-how-to-access-the-app).**
 
@@ -42,48 +44,51 @@ policies — focused on the MENAT regulatory landscape.
 React 19 SPA (Vite + Tailwind CSS v4)
     ↕ HTTP / REST
 Express.js server (server.ts, port 3000)
-    ↕ @google/genai
-Google Gemini (gemini-2.0-flash) + Google Search grounding (web search)
+    ↕ AWS SDK v3
+AWS Bedrock (amazon.nova-pro-v1:0)   +   Tavily Search API (web search)
 ```
 
 - **Frontend:** React 19, TypeScript, Tailwind CSS v4, Lucide React, Recharts, D3.js v7, Motion
-- **Backend:** Express 4 on Node.js (served as a bundled `dist/server.mjs`)
-- **AI engine:** Google Gemini via `@google/genai`
-- **Web search:** Google Search grounding (built into Gemini — no separate search API)
+- **Backend:** Express 4 on Node.js (served as a bundled `dist/server.mjs` in the container)
+- **AI engine:** AWS Bedrock via `@aws-sdk/client-bedrock-runtime`
+- **Web search:** Tavily Search API
 - **PDF export:** jsPDF + jsPDF-AutoTable
 - **Dark slate theme:** `bg-slate-900`, `text-cyan-400`, `text-emerald-400`
-- **No AWS account required** — this is the Gemini edition (see [`README.md`](./README.md)).
 
 ---
 
 ## 3. How to access the app
 
-**Local:** `http://localhost:3000` (after `npm run dev`).
-**Deployed:** whatever public URL your host assigns (Render/Railway/Vercel/etc. — see
-[`README.md`](./README.md)).
+**Deployed (AWS non-prod):**
+`https://compli-alb16-6eesite0yiky-1926867226.us-east-1.elb.amazonaws.com/`
 
-Access flow (single login layer in this edition):
-1. Open the URL (hosted platforms provide a **trusted HTTPS cert** — no warning).
-2. **App login** — ComplianceIQ's own login screen (`ciadmin` / `sasuser*`).
+First-time access flow (there are **two** login layers):
+1. **Browser cert warning** — the non-prod cert is self-signed. Click **Advanced → Proceed**.
+   *(This is expected; see the infra manual's caveats.)*
+2. **Cognito login (with MFA)** — the network-edge gate. Enter your email + password; on first
+   login you set a password and **enroll an authenticator app (TOTP)** for MFA.
+3. **App login** — ComplianceIQ's own login screen (`ciadmin` / `sasuser*`).
 
-> This Gemini edition has **only the app login** (no Cognito/MFA — that's an AWS-edition
-> feature). For a public demo, use your hosting platform's **password protection** to gate the
-> URL. See [`README.md`](./README.md).
+**Who manages Cognito users:** the infra admin (see
+[Infrastructure Manual §9](./infra/INFRASTRUCTURE_MANUAL.md#9-authentication-cognito--mfa)).
 
 ---
 
 ## 4. Accounts, logins & roles
 
-This Gemini edition has a **single login layer** — the app's own login (RBAC). There is no
-Cognito/MFA gate (that's an AWS-edition feature).
+There are **two separate identity systems** — don't confuse them:
+
+| Layer | Who/what | Credentials | Managed where |
+|---|---|---|---|
+| **Cognito (edge gate)** | Access control to even reach the app | Email + password + MFA | AWS Cognito pool `us-east-1_lykHzDirh` |
+| **App login (RBAC)** | In-app roles & permissions | App usernames | Inside the app (`RBACContext`) |
 
 **App accounts:**
 - **`ciadmin`** — administrator; full access incl. the Admin console.
 - **`sasuser1`, `sasuser2`, `sasuser3`** — standard users.
 
-> App RBAC is enforced via the `useRBAC()` hook / `RBACContext`. The app login has **no MFA**.
-> For a public demo URL, gate it with your hosting platform's **password protection** (see
-> [`README.md`](./README.md)), or keep the URL private.
+> App RBAC is enforced via the `useRBAC()` hook / `RBACContext`. The app login currently has
+> **no MFA of its own** — the Cognito+MFA gate in front provides the strong authentication.
 
 ---
 
@@ -94,7 +99,7 @@ The SPA (`src/App.tsx`) is tab-routed. Major areas (components in `src/component
 - **Country Overview** — per-jurisdiction regulatory snapshot.
 - **Regulation Cards / Comparator** — browse regulations; compare across jurisdictions.
 - **Controls Crosswalk** — map controls across NIST / ISO 27001 / CSA CCM.
-- **Control Interpreter** — deep-dive on a control clause (deterministic engine + Gemini).
+- **Control Interpreter** — deep-dive on a control clause (deterministic engine + Bedrock).
 - **AI Redlining** — policy gap analysis against regulatory requirements.
 - **Compliance Maturity Heatmap** — maturity by country/sector.
 - **Regulatory Radar / Watchlist / News Feed / Roadmap / Timeline** — track upcoming and
@@ -108,9 +113,7 @@ The SPA (`src/App.tsx`) is tab-routed. Major areas (components in `src/component
 
 ## 6. AI features & how they work
 
-All AI calls go through the server helper **`invokeClaudeOnBedrock`** (name kept from the AWS
-edition for code compatibility; internally it now calls **Google Gemini**). Signature
-**`invokeClaudeOnBedrock(systemPrompt, userPrompt,
+All AI calls go through the server helper **`invokeClaudeOnBedrock(systemPrompt, userPrompt,
 maxTokens)`** (name is historical — it supports both Nova and Claude). Web search uses
 **`tavilySearch(query, maxResults)`**.
 
@@ -118,7 +121,7 @@ maxTokens)`** (name is historical — it supports both Nova and Claude). Web sea
   model family and builds the correct payload — so the model is **swappable** without code
   changes (see Future Considerations #4).
 - **Graceful degradation:** AI endpoints fall back to **deterministic engines**
-  (`controlInterpreterEngine.ts`, `redlineEngine.ts`) or offline content if Gemini is
+  (`controlInterpreterEngine.ts`, `redlineEngine.ts`) or offline content if Bedrock/Tavily are
   unavailable — so the app stays usable even if an AI dependency is down.
 - **Feature flag:** AI features are gated by `featureFlags.aiCopilot` (Admin console).
 
@@ -142,7 +145,7 @@ The Admin Panel (`src/components/AdminPanel/`) is for `ciadmin` and includes tab
 - **Tracked Sources Manager** — manage scraper sources.
 - **System Backup** — backup-related admin actions.
 
-> Admin edits persist to the JSON data store under `DATA_DIR` (see §8). Use the batch
+> Admin edits persist to the **data store on EFS** (`/app/data`) — see §8. Use the batch
 > transaction pattern (`pendingMilestoneEdits` → `commitMilestoneEdits()` in `AdminContext.tsx`)
 > for date/status changes.
 
@@ -150,9 +153,8 @@ The Admin Panel (`src/components/AdminPanel/`) is for `ciadmin` and includes tab
 
 ## 8. Data model & where data lives
 
-Data lives in JSON files under **`DATA_DIR`** (default `./data/regions`). Admin edits are
-written back to these files. On ephemeral hosts (e.g. some serverless platforms) edits may not
-persist across restarts — mount a volume or use a host with a persistent disk if you need durability.
+**At runtime**, data lives on the **EFS volume at `/app/data`** (`DATA_DIR`), so admin edits
+survive restarts/redeploys. The image ships a **seed copy** from the repo's `data/` folder.
 
 Primary data files (`data/regions/menat/`):
 
@@ -173,7 +175,7 @@ Primary data files (`data/regions/menat/`):
 - `heatmap.ts` — `AIChatMessage`, `HeatmapCellData`, `MaturitySectorId`.
 
 > **No customer/PII data** is stored — only regulatory metadata and internal assessments.
-> **Backups:** none built in — the data files live with the app. Back up `DATA_DIR` yourself if needed.
+> **Backups:** AWS Backup takes daily EFS snapshots (see infra manual §10).
 
 ---
 
@@ -214,7 +216,7 @@ All served by `server.ts` on port 3000. Grouped by area.
 | GET/PUT | `/api/digest/updates`[`/:id`] | Regional digest |
 | GET | `/api/watchlist/notifications` | Watchlist notifications |
 
-**AI (Google Gemini + Google Search grounding)**
+**AI (Bedrock + Tavily)**
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/api/ai/chat` | Multi-turn copilot with web search |
@@ -231,16 +233,17 @@ All served by `server.ts` on port 3000. Grouped by area.
 
 ## 10. Running locally (dev)
 
-For local development:
+For development or to click through the UI without going via AWS:
 ```bash
 npm install
 npm run dev        # full-stack on http://localhost:3000
 ```
-Requires a local `.env` with `GEMINI_API_KEY` (and optionally `GEMINI_MODEL_ID`).
+Requires a local `.env` with `AWS_REGION`, Bedrock access (and `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` for local dev), `BEDROCK_MODEL_ID`, and `TAVILY_API_KEY`.
 Build for container: `npm run build` → `dist/` (Vite SPA + esbuild server bundle).
 
 > **Security note:** keep real keys only in local `.env` (git-ignored). The deployed container
-> never commit it. The deployed host reads `GEMINI_API_KEY` from its environment settings.
+> uses an IAM role for Bedrock and Secrets Manager for Tavily — no static keys.
 
 ---
 
@@ -261,13 +264,65 @@ Djibouti, Somalia, Comoros, Pakistan.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Browser "not private" warning | Self-signed TLS cert (non-prod) | Click Advanced → Proceed; long-term use a real cert (Future Considerations #1) |
-| Can't log in | Wrong app credentials | Use the app accounts in §4 (`ciadmin` / `sasuser*`) |
-| AI chat returns generic/offline answers | Gemini unavailable / bad API key | Check GEMINI_API_KEY; app falls back to deterministic engines |
-| Live news/search empty | GEMINI_API_KEY missing or rate-limited | Set/verify GEMINI_API_KEY |
-| Admin edits lost after restart | Host has ephemeral storage | Use a host with a persistent disk, or mount a volume at `DATA_DIR` |
+| Can't log in at Cognito | No user, or MFA not enrolled | Admin creates/reset the Cognito user (infra manual §9) |
+| "redirect not configured" after MFA | ALB callback URL mismatch | Already fixed in IaC; if ALB was replaced, update the callback (infra manual §9) |
+| AI chat returns generic/offline answers | Bedrock unavailable or model access | Check Bedrock invoke (infra runbook); app falls back to deterministic engines |
+| Live news/search empty | Tavily key missing/expired or rate-limited | Rotate the Tavily secret (infra manual §10) |
+| Admin edits lost after redeploy | Writing outside `/app/data` | Ensure `DATA_DIR=/app/data` (it is, in the task def) — data is on EFS |
 | App unreachable entirely | ECS task unhealthy | Check target health + logs (infra runbook §13) |
 
 ---
 
-*For how to run and deploy this Gemini edition, see
-[`README.md`](./README.md).*
+*For infrastructure operations, deployment, and AWS service details, see
+[`infra/INFRASTRUCTURE_MANUAL.md`](./infra/INFRASTRUCTURE_MANUAL.md).*
+
+## 13. v3.0 Release — Documents, Multi-Admin Sync & Hardened Auth
+
+This section documents the capabilities added in the v3.0 release. They apply to all three editions (AWS normal, AWS External, Gemini), differing only in where files are stored (S3 on AWS, Cloudflare R2 on Gemini).
+
+### 13.1 Regulation documents (upload / download)
+
+Each regulation can carry attached documents (the regulation text, internal RCMs, controls libraries, etc.).
+
+- **All signed-in users** see an **Attached Documents** section on the regulation card and can **download** any document.
+- **Only admins** see the **Upload** control (card + the Edit Regulation modal in the admin console). Normal users never see an upload option.
+- Each document shows a type badge — **Regulation** or **Internal** — the file name (truncated if long, extension preserved), and a download action.
+- **Limits:** max **5 MB per file**, up to **10 documents per regulation**. Allowed types: pdf, doc, docx, xls, xlsx, csv, txt, ppt, pptx.
+- **Where files live:** a **private, encrypted** object-storage bucket (Amazon S3 on AWS editions; Cloudflare R2 on the Gemini edition). The bucket is never public — downloads are proxied by the app, so access is implicitly gated by the app login (and Cognito+MFA at the ALB on AWS).
+
+### 13.2 Login & accounts (bcrypt, server-side)
+
+- Login is verified **on the server** against a **bcrypt** password hash. Passwords are never stored in plaintext and the hash never reaches the browser.
+- The login screen shows **no example usernames or passwords**. There is **no one-click account switching** — to use a different account, **sign out and sign in** again.
+- **Default accounts:** admins `ciadmin1`, `ciadmin2`; normal users `sasuser1`–`sasuser4`. (Passwords are set by an operator and stored only as hashes.)
+- **Admin console** still requires its **second password gate** after an admin signs in.
+- **Change your own password:** account menu (top-right) → **Change Password**. After a successful change you are **signed out** and must log in again with the new password (the old password stops working immediately).
+
+### 13.3 User management (admin)
+
+- **Create user:** Admin Console → User Management → add a user with an initial password (stored as a bcrypt hash).
+- **Reset password:** the **Reset** action sets a brand-new password (no password is ever displayed or copied). The user's old password stops working.
+- **Edit / delete / suspend:** standard MACD operations. All user changes are **server-side** and **sync across all admins** (no per-browser divergence).
+- Passwords are **never displayed** anywhere in the UI (the user list shows "bcrypt-hashed").
+
+### 13.4 Multi-admin synchronization
+
+All admin-mutable data is **server-authoritative** and shared across every admin and device:
+
+- Users/roster, link suggestions, field-correction suggestions, broadcast banner, feature flags, countries/jurisdictions.
+- When one admin accepts/rejects a suggestion (or makes any change), it is resolved for **all** admins — no stale "pending" items and no overrides.
+- The admin console **refetches on open** and offers a **Refresh** button for on-demand updates (there is no background polling, so an admin already sitting on a screen clicks Refresh to pull the latest).
+
+### 13.5 Feature toggles
+
+- Feature toggles gate **normal users only**. **Admins always have access to every feature** regardless of toggle state.
+- The admin **Feature Toggles** tab still shows and edits the true on/off state; toggle state is server-authoritative and shared across admins (and survives restarts).
+
+### 13.6 Audit log
+
+- Every significant action is recorded to a **shared, server-side audit log** stored in object storage **encrypted at rest**.
+- Admin Console → **Audit Log** shows the shared trail (all admins' actions) and offers **Download Audit Log (CSV)** — a readable export of the complete log. A **Refresh** button pulls the latest.
+
+### 13.7 Session timeout (AWS editions)
+
+- The public ALB enforces **Cognito re-authentication (with MFA) at least every 24 hours**. After the session expires you are prompted to sign in again at the Cognito page before reaching the app.
