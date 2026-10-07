@@ -60,19 +60,47 @@ export interface RegulationDocument {
 }
 
 const DOCUMENTS_FILE = 'documents.json';
-const BUCKET = process.env.DOCUMENTS_BUCKET || '';
+
+// Storage backend resolution (Gemini edition):
+//   - Cloudflare R2 (S3-compatible) when R2_* env vars are set — the primary
+//     object store for the zero-AWS Gemini edition.
+//   - Plain AWS S3 when DOCUMENTS_BUCKET is set (kept for portability).
+//   - Local-disk fallback when neither is configured (local dev).
+const R2_ENDPOINT = process.env.R2_ENDPOINT || '';
+const R2_BUCKET = process.env.R2_BUCKET || '';
+const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || '';
+const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || '';
+
+const S3_BUCKET = process.env.DOCUMENTS_BUCKET || '';
 const REGION = process.env.AWS_REGION || 'us-east-1';
 
-/** Lazily-created S3 client (only when a bucket is configured). */
+const USE_R2 = Boolean(R2_ENDPOINT && R2_BUCKET && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY);
+
+/** Effective object-storage bucket name (R2 takes precedence over plain S3). */
+const BUCKET = USE_R2 ? R2_BUCKET : S3_BUCKET;
+
+/** Lazily-created S3 client. Points at Cloudflare R2 when R2 is configured,
+ *  otherwise plain AWS S3. R2 is S3-API-compatible, so the same SDK works. */
 let _s3: S3Client | null = null;
 function getS3(): S3Client {
   if (!_s3) {
-    _s3 = new S3Client({ region: REGION });
+    if (USE_R2) {
+      _s3 = new S3Client({
+        region: 'auto', // R2 ignores region but the SDK requires a value
+        endpoint: R2_ENDPOINT,
+        credentials: {
+          accessKeyId: R2_ACCESS_KEY_ID,
+          secretAccessKey: R2_SECRET_ACCESS_KEY,
+        },
+      });
+    } else {
+      _s3 = new S3Client({ region: REGION });
+    }
   }
   return _s3;
 }
 
-/** True when running against a real S3 bucket (AWS/ECS); false for local dev. */
+/** True when an object store (R2 or S3) is configured; false for local dev. */
 export function isS3Backed(): boolean {
   return Boolean(BUCKET);
 }
